@@ -1,4 +1,5 @@
 import os, re, json, time, uuid, hashlib, secrets, sqlite3, threading
+import concurrent.futures as cf
 from contextlib import closing
 
 import httpx
@@ -131,6 +132,45 @@ def validate_plan(p, body, ids):
             "effect": {"toolName": en, "arguments": ea, "evidence": list(dict.fromkeys(ee))}}
 
 
+ERRS = {}  # model -> last error text (shown by /llmtest, never contains the key)
+
+
+def _ask(model, user, ids, body, deadline):
+    """One model, with its own smart retries, must finish before `deadline`."""
+    payload = {"model": model, "temperature": 0, "max_tokens": 4000,
+               "response_format": {"type": "json_object"},
+               "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]}
+    effort = os.environ.get("LLM_REASONING", "low")
+    if effort and effort.lower() not in ("off", "none", ""):
+        payload["reasoning_effort"] = effort
+    for _ in range(6):
+        remaining = deadline - time.time()
+        if remaining < 2.5:
+            break
+        try:
+            r = httpx.post(f"{LLM_BASE}/chat/completions", headers={"Authorization": f"Bearer {LLM_KEY}"},
+                           json=payload, timeout=httpx.Timeout(remaining, connect=5.0))
+            if r.status_code == 400 and "reasoning_effort" in payload:
+                ERRS[model] = "400 (retrying without reasoning_effort): " + r.text[:200]
+                payload.pop("reasoning_effort")
+                continue
+            if r.status_code == 404:
+                ERRS[model] = "404 model not found: " + r.text[:200]
+                return None
+            r.raise_for_status()
+            txt = r.json()["choices"][0]["message"]["content"].strip()
+            txt = re.sub(r"^```(?:json)?|```$", "", txt, flags=re.M).strip()
+            plan = validate_plan(json.loads(txt), body, ids)
+            plan["model"] = model
+            ERRS[model] = "ok"
+            return plan
+        except Exception as e:
+            ERRS[model] = repr(e)[:250]
+            print("planner attempt failed:", model, ERRS[model])
+            time.sleep(min(1.0, max(0.0, deadline - time.time() - 3)))
+    return None
+
+
 def make_plan(body):
     inc, pol = body["incident"], body["policy"]
     tx = inc["transcript"]
@@ -141,31 +181,28 @@ def make_plan(body):
         "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")},
     }
     user = json.dumps(meta) + "\n\nTRANSCRIPT:\n" + tx
-    start = time.time()
+    deadline = time.time() + float(os.environ.get("PLAN_DEADLINE", "15"))
     models = [LLM_MODEL]
-    if os.environ.get("LLM_FALLBACK_MODEL"):
-        models.append(os.environ["LLM_FALLBACK_MODEL"])
-    attempt = 0
-    while attempt < 5 and time.time() - start < 11:
-        model = models[attempt % len(models)]
-        attempt += 1
-        try:
-            r = httpx.post(
-                f"{LLM_BASE}/chat/completions",
-                headers={"Authorization": f"Bearer {LLM_KEY}"},
-                json={"model": model, "temperature": 0, "response_format": {"type": "json_object"},
-                      "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]},
-                timeout=min(14, 17 - (time.time() - start)),
-            )
-            r.raise_for_status()
-            txt = r.json()["choices"][0]["message"]["content"].strip()
-            txt = re.sub(r"^```(?:json)?|```$", "", txt, flags=re.M).strip()
-            return validate_plan(json.loads(txt), body, ids)
-        except Exception as e:
-            print("planner attempt failed:", model, repr(e)[:150])
-            if "404" in repr(e)[:120] and len(models) > 1:
-                models.remove(model)  # dead model name: stop wasting attempts on it
-            time.sleep(1)
+    fb = os.environ.get("LLM_FALLBACK_MODEL", "").strip()
+    models.append(fb if fb and fb != LLM_MODEL else LLM_MODEL)  # race two calls; first valid plan wins
+    ex = cf.ThreadPoolExecutor(max_workers=len(models))
+    try:
+        futs = [ex.submit(_ask, m, user, ids, body, deadline) for m in models]
+        pending = set(futs)
+        while pending:
+            done, pending = cf.wait(pending, timeout=max(0.1, deadline - time.time() + 0.5),
+                                    return_when=cf.FIRST_COMPLETED)
+            if not done:
+                break
+            for f in done:
+                try:
+                    res = f.result()
+                except Exception:
+                    res = None
+                if res:
+                    return res
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     raise RuntimeError("planner failed")
 
 
@@ -366,7 +403,7 @@ def do_create(body, h_tp=None, h_ts=None, planner=None):
         state = {"runId": run_id, "publicMarker": str(body.get("publicMarker", "")),
                  "agentName": str(body.get("agentName") or "incident-response"),
                  "status": "waiting", "createdAt": created, "modelStart": mstart, "modelEnd": mend,
-                 "model": LLM_MODEL, "trace": trace,
+                 "model": plan.get("model") or LLM_MODEL, "trace": trace,
                  "diagnosis": {"rootCause": plan["rootCause"], "evidence": plan["evidence"]},
                  "approvalRequiredFor": list(pol.get("approvalRequiredFor", [])),
                  "diagnostics": [new_act("diagnostic", d) for d in plan["diagnostics"]],
@@ -545,7 +582,7 @@ def selftest(use_llm=False):
     body = _synthetic_body(run)
     r1 = J(do_create(body, None, None, make_plan if use_llm else _fake_planner))
     if "error" in r1:
-        return {"allPassed": False, "error": "could not create run (LLM key / model problem?)", "checks": checks}
+        return {"allPassed": False, "error": "could not create run", "per_model_last_status": ERRS, "checks": checks}
     ok("first response is waiting with 1-3 diagnostic dispatches",
        r1["status"] == "waiting" and 1 <= len(r1["dispatches"]) <= 3 and all(d["phase"] == "diagnostic" for d in r1["dispatches"]))
     cur, n, did503, last_rb = r1, 0, False, None
@@ -617,19 +654,20 @@ def selftest_route(llm: int = 0):
 
 @app.get("/llmtest")
 def llmtest():
-    """Tiny direct call to each configured model; shows Google's real answer (never the key)."""
-    out = {"base_url": LLM_BASE, "key_set": bool(LLM_KEY), "key_len": len(LLM_KEY), "results": []}
-    models = [LLM_MODEL] + ([os.environ["LLM_FALLBACK_MODEL"]] if os.environ.get("LLM_FALLBACK_MODEL") else [])
-    for m in models:
-        t = time.time()
-        try:
-            r = httpx.post(f"{LLM_BASE}/chat/completions", headers={"Authorization": f"Bearer {LLM_KEY}"},
-                           json={"model": m, "temperature": 0, "response_format": {"type": "json_object"},
-                                 "messages": [{"role": "user", "content": 'Reply with JSON {"ok": true}'}]}, timeout=20)
-            out["results"].append({"model": m, "http": r.status_code, "secs": round(time.time() - t, 1), "body": r.text[:400]})
-        except Exception as e:
-            out["results"].append({"model": m, "exception": repr(e)[:300], "secs": round(time.time() - t, 1)})
-    return out
+    """Runs the REAL planner on a synthetic incident and shows timing + errors (never the key)."""
+    t = time.time()
+    body = _synthetic_body("llmtest-" + uuid.uuid4().hex[:8])
+    ids = set(re.findall(r"(?m)^\s*\[([^\]\s]+)\]", body["incident"]["transcript"]))
+    try:
+        plan = make_plan(body)
+        res = {"ok": True, "model_used": plan["model"], "rootCause": plan["rootCause"], "evidence": plan["evidence"],
+               "diagnostics": [d["toolName"] for d in plan["diagnostics"]], "effect": plan["effect"]["toolName"]}
+    except Exception as e:
+        res = {"ok": False, "error": repr(e)[:200]}
+    res.update({"secs": round(time.time() - t, 1), "per_model_last_status": ERRS,
+                "key_set": bool(LLM_KEY), "key_len": len(LLM_KEY), "base_url": LLM_BASE,
+                "reasoning": os.environ.get("LLM_REASONING", "low")})
+    return res
 
 
 @app.get("/llmmodels")
