@@ -163,6 +163,8 @@ def make_plan(body):
             return validate_plan(json.loads(txt), body, ids)
         except Exception as e:
             print("planner attempt failed:", model, repr(e)[:150])
+            if "404" in repr(e)[:120] and len(models) > 1:
+                models.remove(model)  # dead model name: stop wasting attempts on it
             time.sleep(1)
     raise RuntimeError("planner failed")
 
@@ -628,3 +630,17 @@ def llmtest():
         except Exception as e:
             out["results"].append({"model": m, "exception": repr(e)[:300], "secs": round(time.time() - t, 1)})
     return out
+
+
+@app.get("/llmmodels")
+def llmmodels():
+    """Lists the model ids your key can use (never shows the key)."""
+    try:
+        r = httpx.get(f"{LLM_BASE}/models", headers={"Authorization": f"Bearer {LLM_KEY}"}, timeout=20)
+        try:
+            ids = [m.get("id") for m in r.json().get("data", [])]
+        except Exception:
+            ids = []
+        return {"http": r.status_code, "models": ids, "raw": r.text[:300] if not ids else ""}
+    except Exception as e:
+        return {"exception": repr(e)[:300]}
