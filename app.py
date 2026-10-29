@@ -141,24 +141,29 @@ def make_plan(body):
         "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")},
     }
     user = json.dumps(meta) + "\n\nTRANSCRIPT:\n" + tx
-    start = time.time()
-    for i in range(2):
-        if i and time.time() - start > 6:
-            break
+        start = time.time()
+    models = [LLM_MODEL]
+    if os.environ.get("LLM_FALLBACK_MODEL"):
+        models.append(os.environ["LLM_FALLBACK_MODEL"])
+    attempt = 0
+    while attempt < 5 and time.time() - start < 11:
+        model = models[attempt % len(models)]
+        attempt += 1
         try:
             r = httpx.post(
                 f"{LLM_BASE}/chat/completions",
                 headers={"Authorization": f"Bearer {LLM_KEY}"},
-                json={"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
+                json={"model": model, "temperature": 0, "response_format": {"type": "json_object"},
                       "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]},
-                timeout=14,
+                timeout=min(14, 17 - (time.time() - start)),
             )
             r.raise_for_status()
             txt = r.json()["choices"][0]["message"]["content"].strip()
             txt = re.sub(r"^```(?:json)?|```$", "", txt, flags=re.M).strip()
             return validate_plan(json.loads(txt), body, ids)
         except Exception as e:
-            print("planner attempt failed:", repr(e)[:200])
+            print("planner attempt failed:", model, repr(e)[:150])
+            time.sleep(1)
     raise RuntimeError("planner failed")
 
 
