@@ -141,7 +141,7 @@ def make_plan(body):
         "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")},
     }
     user = json.dumps(meta) + "\n\nTRANSCRIPT:\n" + tx
-        start = time.time()
+    start = time.time()
     models = [LLM_MODEL]
     if os.environ.get("LLM_FALLBACK_MODEL"):
         models.append(os.environ["LLM_FALLBACK_MODEL"])
