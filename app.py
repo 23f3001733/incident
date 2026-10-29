@@ -611,3 +611,20 @@ def selftest(use_llm=False):
 @app.get("/selftest")
 def selftest_route(llm: int = 0):
     return selftest(bool(llm))
+
+
+@app.get("/llmtest")
+def llmtest():
+    """Tiny direct call to each configured model; shows Google's real answer (never the key)."""
+    out = {"base_url": LLM_BASE, "key_set": bool(LLM_KEY), "key_len": len(LLM_KEY), "results": []}
+    models = [LLM_MODEL] + ([os.environ["LLM_FALLBACK_MODEL"]] if os.environ.get("LLM_FALLBACK_MODEL") else [])
+    for m in models:
+        t = time.time()
+        try:
+            r = httpx.post(f"{LLM_BASE}/chat/completions", headers={"Authorization": f"Bearer {LLM_KEY}"},
+                           json={"model": m, "temperature": 0, "response_format": {"type": "json_object"},
+                                 "messages": [{"role": "user", "content": 'Reply with JSON {"ok": true}'}]}, timeout=20)
+            out["results"].append({"model": m, "http": r.status_code, "secs": round(time.time() - t, 1), "body": r.text[:400]})
+        except Exception as e:
+            out["results"].append({"model": m, "exception": repr(e)[:300], "secs": round(time.time() - t, 1)})
+    return out
